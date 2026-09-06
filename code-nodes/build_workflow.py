@@ -146,7 +146,7 @@ nodes = [
 
     node("Enrich via Custom API", "n8n-nodes-base.httpRequest", 4.2, [1000, 0],
          {"method": "POST",
-          "url": "https://REPLACE-ME.up.railway.app/v1/enrich",
+          "url": "https://n8n-market-intel-production.up.railway.app/v1/enrich",
           "authentication": "genericCredentialType",
           "genericAuthType": "httpHeaderAuth",
           "sendBody": True,
@@ -188,7 +188,7 @@ nodes = [
 
     node("Log to Google Sheets", "n8n-nodes-base.googleSheets", 4.5, [1980, 0],
          {"operation": "append",
-          "documentId": {"__rl": True, "value": "REPLACE_WITH_YOUR_SHEET_ID", "mode": "id"},
+          "documentId": {"__rl": True, "value": "1Hxv4g0ORaGia54gN-MSY9DvvmiA4eZYpMpxw3MLtgBQ", "mode": "id"},
           "sheetName": {"__rl": True, "value": "articles", "mode": "name",
                         "cachedResultName": "articles"},
           "columns": {"mappingMode": "autoMapInputData", "value": {},
