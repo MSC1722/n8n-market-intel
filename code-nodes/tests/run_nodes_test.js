@@ -45,3 +45,31 @@ const errOut = run('js_error.js', {
 });
 console.log('--- error handler ---');
 console.log(JSON.stringify(errOut[0].json, null, 1));
+
+console.log('--- error classifier shapes ---');
+const errSrc = fs.readFileSync(__dirname + '/../js_error.js', 'utf8');
+const runErr = (items) => new Function('$input', '$', '$workflow', '$execution', 'console', errSrc)(
+  { all: () => items.map((json) => ({ json })) },
+  () => ({ all: () => [] }),
+  { name: 'Market Intelligence Pipeline' },
+  { id: 'exec_test' },
+  { log: () => {} }
+);
+
+const cases = [
+  ['input echoed, no error object (seen live 2026-09-06)',
+   { id: 'a8e0fd5b', title: 'Budget travellers get thrifty', url: 'https://cnbc.com/x', source: 'cnbc' },
+   (o) => o.first_error_shape === 'id, title, url, source'],
+  ['classic n8n error object, 429',
+   { error: { message: 'Rate limit reached for gpt-4o-mini', httpCode: 429 }, title: 'Nvidia beats' },
+   (o) => o.first_error_stage === 'llm' && o.first_error_status === 429],
+  ['nested upstream body, 401',
+   { error: { status: 401, response: { body: { detail: 'Invalid or missing X-API-Key' } } }, title: 'Fed holds' },
+   (o) => o.first_error_stage === 'enrichment_api' && /X-API-Key/.test(o.first_error_message)],
+];
+
+for (const [label, item, check] of cases) {
+  const out = runErr([item])[0].json;
+  console.log(`  ${check(out) ? 'PASS' : 'FAIL'} — ${label}`);
+  console.log(`         stage=${out.first_error_stage} status=${out.first_error_status} msg="${out.first_error_message}"`);
+}

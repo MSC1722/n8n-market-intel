@@ -14,24 +14,57 @@
 const failures = $input.all();
 if (failures.length === 0) return [];
 
+// n8n's error-output items do not have one fixed shape: depending on the node
+// and the failure, the useful text sits at json.error.message, json.error, a
+// nested response body, or nowhere at all while the item is just the input
+// echoed back. The first live run of this pipeline classified ten real
+// failures as "unknown" for exactly that reason — the handler was reading a
+// shape that n8n does not always produce.
+//
+// So instead of guessing a path, walk the item and take the first thing that
+// looks like a message or a status code, and keep the item's own top-level
+// keys so an unfamiliar shape is visible in the alert rather than swallowed.
+
+const MESSAGE_KEYS = ['message', 'description', 'detail', 'reason', 'errorMessage', 'error_description'];
+const STATUS_KEYS = ['httpCode', 'statusCode', 'status', 'code'];
+
+function harvest(value, depth = 0, found = { message: null, status: null, blobs: [] }) {
+  if (depth > 4 || value === null || typeof value !== 'object') return found;
+
+  for (const [key, child] of Object.entries(value)) {
+    if (!found.message && MESSAGE_KEYS.includes(key) && typeof child === 'string' && child.trim()) {
+      found.message = child.trim();
+    }
+    if (found.status === null && STATUS_KEYS.includes(key) && (typeof child === 'number' || /^\d{3}$/.test(String(child)))) {
+      found.status = Number(child);
+    }
+    if (typeof child === 'string' && child.length > 40 && /error|failed|invalid|denied|timeout/i.test(child)) {
+      found.blobs.push(child.slice(0, 200));
+    }
+    if (child && typeof child === 'object') harvest(child, depth + 1, found);
+  }
+  return found;
+}
+
 function describe(json) {
-  const err = json?.error ?? json;
-  const status = err?.httpCode ?? err?.status ?? err?.statusCode ?? json?.statusCode ?? null;
-  const message = err?.message ?? err?.description ?? err?.detail ?? 'Unknown error';
-  const upstream = err?.response?.body ?? err?.body ?? null;
+  const found = harvest(json?.error ?? json);
+  const status = found.status;
+  const message = found.message ?? found.blobs[0] ?? 'No error message on the item';
 
   let stage = 'unknown';
-  if (typeof message === 'string') {
-    if (/openai|model|token|rate limit/i.test(message)) stage = 'llm';
-    else if (/enrich|econnrefused|etimedout|fetch|socket|502|503|504/i.test(message)) stage = 'enrichment_api';
-  }
+  const haystack = `${message} ${found.blobs.join(' ')}`;
+  if (/openai|model|token|rate limit|completion/i.test(haystack)) stage = 'llm';
+  else if (/enrich|econnrefused|etimedout|fetch|socket|api|x-api-key/i.test(haystack)) stage = 'enrichment_api';
   if (status === 401 || status === 403) stage = stage === 'unknown' ? 'auth' : stage;
+  if (status === 429) stage = stage === 'unknown' ? 'rate_limit' : stage;
 
   return {
     stage,
     status,
     message: String(message).slice(0, 400),
-    upstream: upstream ? String(typeof upstream === 'string' ? upstream : JSON.stringify(upstream)).slice(0, 300) : '',
+    // When the shape is unfamiliar the alert still says what WAS on the item,
+    // which is what you actually need at 3am to fix the handler.
+    shape: Object.keys(json ?? {}).slice(0, 12).join(', '),
     article: json?.title ?? json?.url ?? json?.id ?? '(no article context)',
   };
 }
@@ -57,8 +90,8 @@ return [{
     first_error_stage: worst.stage,
     first_error_status: worst.status ?? 'n/a',
     first_error_message: worst.message,
-    first_error_upstream: worst.upstream,
     first_error_article: worst.article,
+    first_error_shape: worst.shape,
     sample: details.slice(0, 5).map((d) => `• [${d.stage}${d.status ? ' ' + d.status : ''}] ${d.article} — ${d.message}`).join('\n'),
     workflow: $workflow.name,
     execution_url: $execution?.resumeUrl ?? '',

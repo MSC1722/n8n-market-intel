@@ -30,17 +30,33 @@
 `N8N_USER_FOLDER=/home/node` (root로 돌리면 `$HOME`이 바뀌어 데이터가 볼륨 밖에 쌓임).
 **둘 다 넣어야** 풀립니다.
 
-## Day 2 — 워크플로 + 포트폴리오 (3~5시간)
+## Day 2 — 워크플로 (2026-09-06 완료)
 
-| 순서 | 할 일 | 문서 | 예상 |
-|---|---|---|---|
-| 7 | 워크플로 Import, 4개 노드 값 교체 | `docs/CREDENTIALS_SETUP.md` §5 | 20분 |
-| 8 | **RSS 피드 5개 생존 확인** ← 여기서 막힐 확률이 제일 높음 | 같은 문서 §5-3 | 30분 |
-| 9 | 노드 하나씩 Test step → 전체 실행 | | 1시간 |
-| 10 | 에러 브랜치 일부러 터뜨려 보기 | `docs/SCREENSHOT_CHECKLIST.md` 하단 | 15분 |
-| 11 | 스크린샷 5~7장 | `docs/SCREENSHOT_CHECKLIST.md` | 40분 |
-| 12 | README에 스크린샷 삽입 후 push | | 20분 |
-| 13 | 업워크 포트폴리오 항목 등록 | `UPWORK_PORTFOLIO.md` | 20분 |
+| 순서 | 할 일 | 상태 |
+|---|---|---|
+| 7 | 워크플로 Import, 자격증명 연결 | ✅ |
+| 8 | RSS 피드 5개 생존 확인 | ✅ 140건 수집 |
+| 9 | 전체 실행 | ✅ **Success in 11.795s** |
+| 10 | 에러 브랜치 실증 | ⏳ 남음 |
+| 11 | 스크린샷 5~7장 | ⏳ 남음 |
+| 12 | README 삽입 후 push | ⏳ 남음 |
+| 13 | 업워크 포트폴리오 등록 | ⏳ 남음 |
+
+**최종 실행 파이프라인**
+
+```
+Every 6 Hours 1 → Feed Registry 5 → Fetch RSS 140 → Normalize & Deduplicate 10
+→ Summarize & Classify 10 → Parse LLM Output 10 → Enrich via Custom API 10
+→ Assemble Record 10 → Route by Priority (high 0 / rest 10) → Google Sheets 10 ✅
+```
+
+## Day 3 — 스크린샷 (평일 장중)
+
+Slack 알림은 `relevance_score >= 70` 에서만 나갑니다. 2026-09-06(일요일) 실행에서는 최고 점수가 **63**이라 알림이 안 갔습니다. 시장 휴장 + 뉴스 한산이 원인입니다.
+
+**평일 미국 장중(한국시간 22:30~05:00)에 Execute workflow 를 다시 눌러 주세요.** 그때 `#market-alerts` 알림 스크린샷을 찍으면 됩니다.
+
+임계값은 `Route by Priority` 노드의 `rightValue` 에 있습니다. 평일 데이터를 보고도 계속 안 걸리면 그때 55~60으로 재보정하는 게 맞습니다 — 실측 분포를 근거로 조정하는 건 정당한 튜닝입니다.
 
 ## 지금 바로 확인할 수 있는 것
 

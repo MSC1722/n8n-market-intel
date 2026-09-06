@@ -189,7 +189,9 @@ nodes = [
     node("Log to Google Sheets", "n8n-nodes-base.googleSheets", 4.5, [1980, 0],
          {"operation": "append",
           "documentId": {"__rl": True, "value": "1Hxv4g0ORaGia54gN-MSY9DvvmiA4eZYpMpxw3MLtgBQ", "mode": "id"},
-          "sheetName": {"__rl": True, "value": "articles", "mode": "name",
+          # "name" mode fails with "Sheet with name articles not found" on
+          # n8n 2.37 even when the tab is named exactly that; "list" resolves.
+          "sheetName": {"__rl": True, "value": "articles", "mode": "list",
                         "cachedResultName": "articles"},
           "columns": {"mappingMode": "autoMapInputData", "value": {},
                       "matchingColumns": [], "schema": []},
