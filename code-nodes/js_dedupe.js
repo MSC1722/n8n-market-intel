@@ -56,22 +56,29 @@ function fnv1a(str) {
   return h.toString(16).padStart(8, '0');
 }
 
+// Parsed by hand rather than with `new URL()`. The n8n 2.x task runner sandbox
+// does not reliably expose the WHATWG URL constructor, and when it throws every
+// article silently falls back to source "unknown" (weight 0.5) — the ranking
+// still "works", it just ranks everything identically. Found by running it.
+const TRACKING_PARAMS = ['fbclid', 'gclid', 'mc_cid', 'mc_eid', 'ref', 'ito', 'mod', 'yptr'];
+
 function canonicalise(rawUrl) {
-  try {
-    const u = new URL(rawUrl);
-    const keep = new URLSearchParams();
-    for (const [k, v] of u.searchParams) {
-      const key = k.toLowerCase();
-      if (key.startsWith('utm_') || ['fbclid', 'gclid', 'mc_cid', 'mc_eid', 'ref', 'ito'].includes(key)) continue;
-      keep.append(k, v);
-    }
-    const host = u.hostname.toLowerCase().replace(/^www\./, '');
-    const path = u.pathname.replace(/\/+$/, '') || '/';
-    const qs = keep.toString();
-    return { url: `https://${host}${path}${qs ? '?' + qs : ''}`, host };
-  } catch (e) {
-    return { url: String(rawUrl || '').trim(), host: '' };
-  }
+  const raw = String(rawUrl || '').trim();
+  const m = raw.match(/^(https?):\/\/([^/?#]+)([^?#]*)(?:\?([^#]*))?/i);
+  if (!m) return { url: raw, host: '' };
+
+  const host = m[2].toLowerCase().replace(/^www\./, '').replace(/:\d+$/, '');
+  const path = (m[3] || '/').replace(/\/+$/, '') || '/';
+  const query = (m[4] || '')
+    .split('&')
+    .filter(Boolean)
+    .filter((kv) => {
+      const key = kv.split('=')[0].toLowerCase();
+      return !key.startsWith('utm_') && !TRACKING_PARAMS.includes(key);
+    })
+    .sort();
+
+  return { url: `https://${host}${path}${query.length ? '?' + query.join('&') : ''}`, host };
 }
 
 function sourceOf(host) {
@@ -181,7 +188,8 @@ for (const article of normalised) {
 // and re-alerts on a story that was already sent.
 if (memoryAvailable) for (const id of [...kept.map((a) => a.id), ...suppressed]) memory[id] = now;
 
-console.log(`dedupe: fetched=${stats.fetched} kept=${kept.length} exact=${stats.exact} near=${stats.near} seen_before=${stats.seen_before} capped=${stats.capped} memory=${memoryAvailable}`);
+console.log(`dedupe: fetched=${stats.fetched} normalised=${stats.normalised} kept=${kept.length} exact=${stats.exact} near=${stats.near} seen_before=${stats.seen_before} capped=${stats.capped} memory=${memoryAvailable} urlCtor=${typeof URL}`);
+console.log('sources: ' + JSON.stringify(kept.reduce((a, k) => ({ ...a, [k.source]: (a[k.source] || 0) + 1 }), {})));
 
 // tokens is a Set — strip it before it leaves the node.
 return kept.map(({ tokens: _t, ...rest }) => ({ json: { ...rest, dedupe_stats: stats } }));
