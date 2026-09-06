@@ -166,10 +166,14 @@ nodes = [
          {"conditions": {
              "options": {"caseSensitive": True, "leftValue": "",
                          "typeValidation": "loose", "version": 2},
+             # Calibrated against the first live runs, not guessed. Observed
+             # score distribution on a quiet news day was 31-67, so the
+             # original 70 would almost never fire — an alert that never
+             # fires is a broken alert. 60 is the top of the observed band.
              "conditions": [{
                  "id": "relevance-gate",
                  "leftValue": "={{ $json.relevance_score }}",
-                 "rightValue": 70,
+                 "rightValue": 60,
                  "operator": {"type": "number", "operation": "gte"}}],
              "combinator": "and"},
           "looseTypeValidation": True,

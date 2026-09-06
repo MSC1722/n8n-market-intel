@@ -247,7 +247,7 @@
             {
               "id": "relevance-gate",
               "leftValue": "={{ $json.relevance_score }}",
-              "rightValue": 70,
+              "rightValue": 60,
               "operator": {
                 "type": "number",
                 "operation": "gte"
