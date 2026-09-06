@@ -27,8 +27,11 @@ if (failures.length === 0) return [];
 
 const MESSAGE_KEYS = ['message', 'description', 'detail', 'reason', 'errorMessage', 'error_description'];
 const STATUS_KEYS = ['httpCode', 'statusCode', 'status', 'code'];
+// The request target is often the only thing that says WHICH dependency broke:
+// a DNS or connection error message names a host, never the workflow stage.
+const TARGET_KEYS = ['url', 'uri', 'hostname', 'host', 'endpoint', 'baseURL'];
 
-function harvest(value, depth = 0, found = { message: null, status: null, blobs: [] }) {
+function harvest(value, depth = 0, found = { message: null, status: null, blobs: [], targets: [] }) {
   if (depth > 4 || value === null || typeof value !== 'object') return found;
 
   for (const [key, child] of Object.entries(value)) {
@@ -37,6 +40,9 @@ function harvest(value, depth = 0, found = { message: null, status: null, blobs:
     }
     if (found.status === null && STATUS_KEYS.includes(key) && (typeof child === 'number' || /^\d{3}$/.test(String(child)))) {
       found.status = Number(child);
+    }
+    if (TARGET_KEYS.includes(key) && typeof child === 'string' && /^https?:\/\//i.test(child)) {
+      found.targets.push(child.slice(0, 200));
     }
     if (typeof child === 'string' && child.length > 40 && /error|failed|invalid|denied|timeout/i.test(child)) {
       found.blobs.push(child.slice(0, 200));
@@ -51,12 +57,19 @@ function describe(json) {
   const status = found.status;
   const message = found.message ?? found.blobs[0] ?? 'No error message on the item';
 
+  // Match against the message, any error-ish text found, AND the request
+  // target. A DNS failure reads "getaddrinfo ENOTFOUND <host>" — it names the
+  // host but never the stage, so without the target the first live error-lane
+  // test classified ten real failures as "unknown".
+  const haystack = `${message} ${found.blobs.join(' ')} ${found.targets.join(' ')}`;
+  const NETWORK = /getaddrinfo|enotfound|econnrefused|econnreset|etimedout|ehostunreach|socket hang up|network|timeout/i;
+
   let stage = 'unknown';
-  const haystack = `${message} ${found.blobs.join(' ')}`;
-  if (/openai|model|token|rate limit|completion/i.test(haystack)) stage = 'llm';
-  else if (/enrich|econnrefused|etimedout|fetch|socket|api|x-api-key/i.test(haystack)) stage = 'enrichment_api';
+  if (/openai|gpt-|model|completion|rate limit/i.test(haystack)) stage = 'llm';
+  else if (/enrich|x-api-key|market-intel/i.test(haystack)) stage = 'enrichment_api';
+  else if (NETWORK.test(haystack)) stage = 'network';
   if (status === 401 || status === 403) stage = stage === 'unknown' ? 'auth' : stage;
-  if (status === 429) stage = stage === 'unknown' ? 'rate_limit' : stage;
+  if (status === 429) stage = 'rate_limit';
 
   return {
     stage,
@@ -65,6 +78,7 @@ function describe(json) {
     // When the shape is unfamiliar the alert still says what WAS on the item,
     // which is what you actually need at 3am to fix the handler.
     shape: Object.keys(json ?? {}).slice(0, 12).join(', '),
+    target: found.targets[0] ?? '',
     article: json?.title ?? json?.url ?? json?.id ?? '(no article context)',
   };
 }
@@ -92,6 +106,7 @@ return [{
     first_error_message: worst.message,
     first_error_article: worst.article,
     first_error_shape: worst.shape,
+    first_error_target: worst.target,
     sample: details.slice(0, 5).map((d) => `• [${d.stage}${d.status ? ' ' + d.status : ''}] ${d.article} — ${d.message}`).join('\n'),
     workflow: $workflow.name,
     execution_url: $execution?.resumeUrl ?? '',

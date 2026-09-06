@@ -46,30 +46,32 @@ const errOut = run('js_error.js', {
 console.log('--- error handler ---');
 console.log(JSON.stringify(errOut[0].json, null, 1));
 
-console.log('--- error classifier shapes ---');
+console.log('--- error classifier: stage + message extraction ---');
 const errSrc = fs.readFileSync(__dirname + '/../js_error.js', 'utf8');
-const runErr = (items) => new Function('$input', '$', '$workflow', '$execution', 'console', errSrc)(
-  { all: () => items.map((json) => ({ json })) },
+const runErr = (item) => new Function('$input', '$', '$workflow', '$execution', 'console', errSrc)(
+  { all: () => [{ json: item }] },
   () => ({ all: () => [] }),
   { name: 'Market Intelligence Pipeline' },
   { id: 'exec_test' },
   { log: () => {} }
-);
+)[0].json;
 
-const cases = [
-  ['input echoed, no error object (seen live 2026-09-06)',
-   { id: 'a8e0fd5b', title: 'Budget travellers get thrifty', url: 'https://cnbc.com/x', source: 'cnbc' },
-   (o) => o.first_error_shape === 'id, title, url, source'],
-  ['classic n8n error object, 429',
-   { error: { message: 'Rate limit reached for gpt-4o-mini', httpCode: 429 }, title: 'Nvidia beats' },
-   (o) => o.first_error_stage === 'llm' && o.first_error_status === 429],
-  ['nested upstream body, 401',
-   { error: { status: 401, response: { body: { detail: 'Invalid or missing X-API-Key' } } }, title: 'Fed holds' },
-   (o) => o.first_error_stage === 'enrichment_api' && /X-API-Key/.test(o.first_error_message)],
+const API = 'https://n8n-market-intel-production.up.railway.app/v1/enrich';
+const errorCases = [
+  ['DNS failure on the enrichment host (live case, 2026-09-06)',
+   { error: { message: 'getaddrinfo ENOTFOUND n8n-market-intel-p-broken', url: API }, title: 'Sugar outperforms' }, 'enrichment_api'],
+  ['404 from the enrichment host',
+   { error: { httpCode: 404, message: 'The resource you are requesting could not be found', url: API }, title: 'x' }, 'enrichment_api'],
+  ['OpenAI rate limit', { error: { message: 'Rate limit reached for gpt-4o-mini', httpCode: 429 }, title: 'y' }, 'rate_limit'],
+  ['OpenAI overloaded', { error: { message: 'The model gpt-4o-mini is currently overloaded' }, title: 'z' }, 'llm'],
+  ['bad API key', { error: { status: 401, response: { body: { detail: 'Invalid or missing X-API-Key' } } }, title: 'w' }, 'enrichment_api'],
+  ['bare network timeout', { error: { message: 'socket hang up' }, title: 'v' }, 'network'],
+  ['no error object at all — item echoed back',
+   { id: 'a8e0fd5b', title: 'Budget travellers', url: 'https://cnbc.com/x' }, 'unknown'],
 ];
 
-for (const [label, item, check] of cases) {
-  const out = runErr([item])[0].json;
-  console.log(`  ${check(out) ? 'PASS' : 'FAIL'} — ${label}`);
-  console.log(`         stage=${out.first_error_stage} status=${out.first_error_status} msg="${out.first_error_message}"`);
+for (const [label, item, want] of errorCases) {
+  const o = runErr(item);
+  console.log(`  ${o.first_error_stage === want ? 'PASS' : 'FAIL'} — ${label}`);
+  console.log(`         stage=${o.first_error_stage} status=${o.first_error_status} msg="${o.first_error_message.slice(0, 60)}"`);
 }
