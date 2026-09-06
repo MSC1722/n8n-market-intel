@@ -70,6 +70,20 @@ that happened to publish frequently. The cap is now applied round-robin across
 sources, one item per source per pass, with pass order still following source
 weight.
 
+Two more surfaced once the pipeline ran end to end:
+
+**The failure classifier could not name the stage.** A DNS error reads
+`getaddrinfo ENOTFOUND <host>` — it names a host and nothing else, so matching
+on the message text alone classified ten real failures as `unknown`. The
+handler now also reads the *request target* out of the error object, which is
+what actually identifies the dependency. Seven cases are pinned by tests.
+
+**A node in the wrong place silently corrupted the sheet.** Routing high-impact
+items through the Slack node *into* the Sheets node meant Sheets received
+Slack's API response (`{ok, channel, ts}`) rather than the article — one
+garbage row per alert, no error anywhere. The router now fans out: every
+article goes to the sheet, high-impact ones additionally to Slack.
+
 ### 2. A FastAPI service called over HTTP
 
 [`fastapi-service/`](./fastapi-service) is deployed as its own Railway container

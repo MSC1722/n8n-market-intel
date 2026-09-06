@@ -498,19 +498,13 @@
             "node": "Slack: High-Impact Alert",
             "type": "main",
             "index": 0
-          }
-        ],
-        [
+          },
           {
             "node": "Log to Google Sheets",
             "type": "main",
             "index": 0
           }
-        ]
-      ]
-    },
-    "Slack: High-Impact Alert": {
-      "main": [
+        ],
         [
           {
             "node": "Log to Google Sheets",

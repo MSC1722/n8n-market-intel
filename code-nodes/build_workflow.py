@@ -235,10 +235,15 @@ connections = {
         [{"node": "Assemble Record", "type": "main", "index": 0}],
         [{"node": "Handle Failure", "type": "main", "index": 0}]]},
     "Assemble Record": main("Route by Priority"),
+    # Every article is logged; high-priority ones are ALSO alerted. The Slack
+    # node must not sit between the router and the sheet: a node's output
+    # replaces the item, so chaining Slack -> Sheets writes the Slack API
+    # response ({ok, channel, ts}) into the sheet instead of the article.
+    # Caught by running it — one garbage row per alert.
     "Route by Priority": {"main": [
-        [{"node": "Slack: High-Impact Alert", "type": "main", "index": 0}],
+        [{"node": "Slack: High-Impact Alert", "type": "main", "index": 0},
+         {"node": "Log to Google Sheets", "type": "main", "index": 0}],
         [{"node": "Log to Google Sheets", "type": "main", "index": 0}]]},
-    "Slack: High-Impact Alert": main("Log to Google Sheets"),
     "Handle Failure": main("Slack: Pipeline Failure"),
 }
 
