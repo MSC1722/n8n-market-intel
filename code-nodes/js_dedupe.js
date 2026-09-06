@@ -167,21 +167,45 @@ try {
 // ── 3. rank, then de-duplicate ─────────────────────────────────────────────
 normalised.sort((a, b) => (b.source_weight - a.source_weight) || ((a.age_hours ?? 99) - (b.age_hours ?? 99)));
 
-const kept = [];
+// ── 3a. de-duplicate (no cap yet) ──────────────────────────────────────────
+const eligible = [];
 const suppressed = [];   // duplicates we must also remember, see below
 const stats = { fetched: $input.all().length, normalised: normalised.length, exact: 0, near: 0, seen_before: 0, capped: 0 };
 
 for (const article of normalised) {
-  if (kept.length >= MAX_ITEMS) { stats.capped++; continue; }   // not "seen" — retry next run
-
-  if (kept.some((k) => k.id === article.id)) { stats.exact++; suppressed.push(article.id); continue; }
+  if (eligible.some((k) => k.id === article.id)) { stats.exact++; suppressed.push(article.id); continue; }
   if (memoryAvailable && memory[article.id]) { stats.seen_before++; continue; }
 
-  const twin = kept.find((k) => k.source !== article.source && jaccard(k.tokens, article.tokens) >= TITLE_SIMILARITY);
+  const twin = eligible.find((k) => k.source !== article.source && jaccard(k.tokens, article.tokens) >= TITLE_SIMILARITY);
   if (twin) { stats.near++; suppressed.push(article.id); continue; }
 
-  kept.push(article);
+  eligible.push(article);
 }
+
+// ── 3b. cap round-robin across sources ─────────────────────────────────────
+// Taking the top MAX_ITEMS straight off a weight-sorted list lets the single
+// highest-weighted outlet that happens to publish a lot fill the entire batch —
+// the first run of this pipeline returned ten CNBC articles and nothing else.
+// One item per source per pass keeps the batch representative, while the pass
+// order still respects source weight.
+const bySource = new Map();
+for (const article of eligible) {
+  if (!bySource.has(article.source)) bySource.set(article.source, []);
+  bySource.get(article.source).push(article);
+}
+const queues = [...bySource.values()].sort((a, b) => b[0].source_weight - a[0].source_weight);
+
+const kept = [];
+let drained = false;
+while (kept.length < MAX_ITEMS && !drained) {
+  drained = true;
+  for (const queue of queues) {
+    if (kept.length >= MAX_ITEMS) break;
+    const next = queue.shift();
+    if (next) { kept.push(next); drained = false; }
+  }
+}
+stats.capped = eligible.length - kept.length;   // not "seen" — they retry next run
 
 // Remember the suppressed ones too. Without this, tomorrow's run drops the WSJ
 // original as "seen", finds no twin for the CNBC retelling still in the feed,

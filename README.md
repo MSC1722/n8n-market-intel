@@ -55,6 +55,21 @@ The node is written for the n8n 2.x task runner — no `require()` anywhere, so
 the hash function (FNV-1a) is implemented by hand rather than pulled from
 `crypto`, which is not allow-listed by default.
 
+Two things in this node were only found by running it against live feeds, and
+both failed *silently* — no error, no red node, just quietly wrong output:
+
+**`new URL()` is not usable in the task runner sandbox.** The constructor threw,
+the `catch` returned the raw link, and every article came back with
+`host: ""` → `source: "unknown"` → `source_weight: 0.5`. The ranking still
+"worked"; it just ranked everything identically, so the batch was ordered by
+publication time alone. URL parsing is now done with an explicit regex.
+
+**A weight-sorted top-N lets one outlet take the whole batch.** With the source
+weights fixed, the first ten articles were all CNBC — the highest-weighted feed
+that happened to publish frequently. The cap is now applied round-robin across
+sources, one item per source per pass, with pass order still following source
+weight.
+
 ### 2. A FastAPI service called over HTTP
 
 [`fastapi-service/`](./fastapi-service) is deployed as its own Railway container
