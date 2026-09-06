@@ -14,7 +14,7 @@ Schedule (6h) → Feed registry → RSS ─┐
                                                                                │
                                                      ┌─────────────────────────┴──────────┐
                                                      ▼                                    ▼
-                                            score ≥ 70 → Slack alert              error lane →
+                                            score ≥ 60 → Slack alert              error lane →
                                                      └──────────→ Google Sheets    classified
                                                                                    Slack alert
 ```
@@ -26,6 +26,11 @@ Schedule (6h) → Feed registry → RSS ─┐
 | **Model** | `gpt-4o-mini`, JSON-mode, 3 retries with backoff |
 | **Nodes** | 13 (4 of them custom JavaScript) |
 | **Tests** | 20 (`pytest`) covering entity resolution, clustering and scoring |
+
+![Workflow canvas](./screenshots/01-workflow-canvas.png)
+
+*13 nodes on self-hosted n8n. The three highlighted blocks are the parts that are
+not drag-and-drop.*
 
 ---
 
@@ -84,6 +89,10 @@ Slack's API response (`{ok, channel, ts}`) rather than the article — one
 garbage row per alert, no error anywhere. The router now fans out: every
 article goes to the sheet, high-impact ones additionally to Slack.
 
+![Normalize & Deduplicate node](./screenshots/03-dedupe-code-node.png)
+
+*139 items in, 10 out — one execution, live feeds.*
+
 ### 2. A FastAPI service called over HTTP
 
 [`fastapi-service/`](./fastapi-service) is deployed as its own Railway container
@@ -120,13 +129,26 @@ which puts the second outlet on a genuinely big story in the medium tier and the
 fifth one below the alert threshold. Every response carries the full breakdown,
 so any alert can be audited after the fact.
 
-```jsonc
-// same story, first telling vs fifth
-{ "relevance_score": 93.27, "priority": "high",
-  "reason": "top contributor: impact (0.90), weakest: source (1.00)" }
-{ "relevance_score": 38.60, "priority": "low",
-  "reason": "…; x0.45 repeat-story penalty (cluster of 5)" }
-```
+Two live calls against the deployed service — the same Nvidia earnings story,
+filed by Reuters and then by CNBC half an hour later under a different headline
+(`62%` vs `62 percent`) at a different URL:
+
+| | Reuters (first) | CNBC (same story) |
+|---|---|---|
+| `cluster_id` | `c_5e16f45e44` | `c_5e16f45e44` |
+| `is_followup` | `false` | `true` |
+| `novelty` | `1.0` | `0.7071` |
+| `relevance_score` | **82.38** | **58.83** |
+| `priority` | `high` | `medium` |
+
+<p align="center">
+  <img src="./screenshots/04-enrich-first-call.png" width="49%" alt="First telling: 82.38, high" />
+  <img src="./screenshots/05-enrich-repeat-story.png" width="49%" alt="Repeat story: 58.83, medium" />
+</p>
+
+The second one drops out of the Slack alert tier without any keyword rule saying
+so. By the fifth retelling the multiplier is at its floor and the story scores
+in the low tier.
 
 ### 3. An error lane that is worth waking up for
 
@@ -139,6 +161,29 @@ ones still reach the sheet.
 
 Every leaf node has an explicit failure policy: a dead RSS feed continues with an
 empty item, Slack being down does not stop a row reaching Google Sheets.
+
+<p align="center">
+  <img src="./screenshots/06-slack-high-impact-alert.png" width="49%" alt="High-impact alert" />
+  <img src="./screenshots/07-slack-failure-alert.png" width="49%" alt="Classified failure alert" />
+</p>
+
+*Left: an alert carrying its own score breakdown. Right: the enrichment API
+unreachable — ten items failed, zero delivered, stage named, one message.*
+
+---
+
+## It runs
+
+![Execution](./screenshots/02-execution-success.png)
+
+*Item counts on the connections: 5 feeds → 139 articles → 10 after
+de-duplication → 9 rows plus 1 Slack alert. 13.1 s end to end.*
+
+![Google Sheets output](./screenshots/08-google-sheets-output.png)
+
+*Accumulated across runs. `cluster_id`, `is_followup`, `score_novelty` and
+`score_reason` are written alongside every row, so any score can be audited
+later.*
 
 ---
 
@@ -155,6 +200,7 @@ fastapi-service/                       Enrichment API
 docs/RAILWAY_SETUP.md                  Self-hosting n8n 2.x on Railway
 docs/DEPLOY_API.md                     Deploying the enrichment service
 docs/CREDENTIALS_SETUP.md              OpenAI / Google Sheets / Slack / header auth
+screenshots/                           Canvas, execution, API calls, Slack, Sheets
 ```
 
 ## Running the API locally
