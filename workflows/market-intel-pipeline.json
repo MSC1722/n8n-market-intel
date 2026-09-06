@@ -1,0 +1,549 @@
+{
+  "name": "Market Intelligence Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Market Intelligence Pipeline\nRSS → LLM classification → custom enrichment API → priority routing → Slack + Google Sheets.\n\nRuns every 6 hours on self-hosted n8n (Railway, Docker).\n\nThe three highlighted blocks are the parts that are **not** drag-and-drop.",
+        "height": 250,
+        "width": 460,
+        "color": 7
+      },
+      "id": "Note Intro",
+      "name": "Note Intro",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1 · Custom Code node\nn8n's *Remove Duplicates* compares one field, exactly, inside one execution.\n\nThis node instead:\n• normalises field drift across 5 feeds\n• strips tracking params to canonicalise URLs\n• catches **near**-duplicates via Jaccard similarity on title tokens\n• remembers what it sent in **previous runs** using workflow static data (72h window)\n\nWritten to run inside the n8n 2.x task runner — no `require()`, hash implemented by hand.",
+        "height": 250,
+        "width": 380,
+        "color": 4
+      },
+      "id": "Note Code",
+      "name": "Note Code",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        220,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2 · Custom FastAPI service\nOwn service, deployed as a second Railway container, called over HTTP.\n\nDoes what no n8n node can:\n• alias-aware entity resolution — *the Fed / FOMC / Powell* → one symbol; rejects \"fed up\" and \"apple harvest\"\n• SimHash + Jaccard story clustering **persisted in SQLite**, so the same story from a second outlet six hours later is a known repeat\n• deterministic 0-100 relevance score with an auditable breakdown\n\nAuth via header credential — the key never enters this workflow JSON.",
+        "height": 250,
+        "width": 400,
+        "color": 5
+      },
+      "id": "Note API",
+      "name": "Note API",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        960,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3 · Error lane\nThe model call and the API call each retry 3× with backoff. Only a *persistent* failure reaches this branch.\n\nThe handler classifies the failure by stage, checks whether the run still delivered anything (degraded vs critical), and posts one actionable Slack message — not a raw stack trace.\n\nItems that fail do not abort the run: the healthy ones still reach the sheet.",
+        "height": 220,
+        "width": 560,
+        "color": 3
+      },
+      "id": "Note Errors",
+      "name": "Note Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "every-6-hours",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Feed registry\n// Kept in a Code node rather than hard-coded in the RSS node so that the list\n// is versioned with the workflow and one dead feed does not require rewiring\n// the canvas. The RSS node below runs once per item emitted here.\n// ─────────────────────────────────────────────────────────────────────────────\nconst FEEDS = [\n  { url: 'https://feeds.a.dj.com/rss/RSSMarketsMain.xml',            desk: 'markets'  },\n  { url: 'https://www.cnbc.com/id/20910258/device/rss/rss.html',     desk: 'economy'  },\n  { url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html',    desk: 'topnews'  },\n  { url: 'https://www.marketwatch.com/rss/topstories',              desk: 'markets'  },\n  { url: 'https://finance.yahoo.com/news/rssindex',                 desk: 'markets'  },\n];\n\nreturn FEEDS.map((feed) => ({ json: { ...feed, queued_at: new Date().toISOString() } }));\n"
+      },
+      "id": "feed-registry",
+      "name": "Feed Registry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {}
+      },
+      "id": "fetch-rss",
+      "name": "Fetch RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "One dead feed must not kill the run — errors continue with an empty item."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Normalise + de-duplicate\n//\n// n8n ships a \"Remove Duplicates\" node. It compares one field, exactly, within\n// a single execution. A news pipeline needs four things it cannot do:\n//\n//   1. Field drift    — every feed names things differently (isoDate / pubDate /\n//                       date; contentSnippet / content / description).\n//   2. URL noise      — the same article arrives with different utm_* params,\n//                       so an exact-match comparison sees two distinct URLs.\n//   3. Near-duplicates— two outlets run the same story under different\n//                       headlines. Exact matching never catches those.\n//   4. Cross-run memory — the run six hours ago already alerted on this story.\n//                       A per-execution node has no memory at all.\n//\n// (1)-(3) are handled below; (4) uses getWorkflowStaticData, which n8n persists\n// between executions, with a rolling 72h window so it cannot grow unbounded.\n//\n// No require() anywhere: n8n 2.x runs Code nodes inside an isolated task runner\n// where Node built-ins are not allow-listed by default, so the hash is written\n// out by hand (FNV-1a).\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst MAX_AGE_HOURS    = 24;   // ignore anything older than this\nconst MAX_ITEMS        = 10;   // cap LLM spend per run\nconst TITLE_SIMILARITY = 0.55; // Jaccard threshold for \"same story\"\nconst MEMORY_HOURS     = 72;   // how long we remember a URL across runs\n\n// Source reputation. The article's own hostname is authoritative — feed URLs\n// syndicate, article links do not.\nconst SOURCES = {\n  'wsj.com': ['wsj', 0.95],\n  'dowjones.com': ['wsj', 0.95],\n  'cnbc.com': ['cnbc', 0.85],\n  'reuters.com': ['reuters', 1.0],\n  'bloomberg.com': ['bloomberg', 1.0],\n  'ft.com': ['ft', 0.95],\n  'marketwatch.com': ['marketwatch', 0.75],\n  'yahoo.com': ['yahoo_finance', 0.65],\n  'investing.com': ['investing_com', 0.6],\n  'seekingalpha.com': ['seeking_alpha', 0.55],\n};\n\nconst STOPWORDS = new Set(('a an the and or but if then than that this these those of in on at ' +\n  'to for from by with as is are was were be been being it its his her their our your my we ' +\n  'you they he she has have had do does did not no nor so such over under after before about ' +\n  'says say said report reports new news update updates amid amp will can could may').split(' '));\n\n// ── helpers ────────────────────────────────────────────────────────────────\nfunction fnv1a(str) {\n  let h = 0x811c9dc5;\n  for (let i = 0; i < str.length; i++) {\n    h ^= str.charCodeAt(i);\n    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;\n  }\n  return h.toString(16).padStart(8, '0');\n}\n\nfunction canonicalise(rawUrl) {\n  try {\n    const u = new URL(rawUrl);\n    const keep = new URLSearchParams();\n    for (const [k, v] of u.searchParams) {\n      const key = k.toLowerCase();\n      if (key.startsWith('utm_') || ['fbclid', 'gclid', 'mc_cid', 'mc_eid', 'ref', 'ito'].includes(key)) continue;\n      keep.append(k, v);\n    }\n    const host = u.hostname.toLowerCase().replace(/^www\\./, '');\n    const path = u.pathname.replace(/\\/+$/, '') || '/';\n    const qs = keep.toString();\n    return { url: `https://${host}${path}${qs ? '?' + qs : ''}`, host };\n  } catch (e) {\n    return { url: String(rawUrl || '').trim(), host: '' };\n  }\n}\n\nfunction sourceOf(host) {\n  for (const domain of Object.keys(SOURCES)) {\n    if (host === domain || host.endsWith('.' + domain)) return SOURCES[domain];\n  }\n  return ['unknown', 0.5];\n}\n\nfunction tokens(text) {\n  return new Set(\n    String(text || '')\n      .toLowerCase()\n      .replace(/[^a-z0-9' ]+/g, ' ')\n      .split(/\\s+/)\n      .filter((w) => w.length > 2 && !STOPWORDS.has(w))\n  );\n}\n\nfunction jaccard(a, b) {\n  if (!a.size || !b.size) return 0;\n  let shared = 0;\n  for (const t of a) if (b.has(t)) shared++;\n  return shared / (a.size + b.size - shared);\n}\n\nfunction pickDate(row) {\n  const raw = row.isoDate || row.pubDate || row.published || row.date || row.updated;\n  const d = raw ? new Date(raw) : null;\n  return d && !isNaN(d.getTime()) ? d : null;\n}\n\nfunction clean(text, limit) {\n  return String(text || '')\n    .replace(/<[^>]*>/g, ' ')\n    .replace(/&[a-z]+;/gi, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, limit);\n}\n\n// ── 1. normalise ───────────────────────────────────────────────────────────\nconst now = Date.now();\nconst cutoff = now - MAX_AGE_HOURS * 3600 * 1000;\nconst normalised = [];\n\nfor (const item of $input.all()) {\n  const row = item.json;\n  const link = row.link || row.guid || row.id;\n  if (!link || !row.title) continue;\n\n  const { url, host } = canonicalise(link);\n  const [source, weight] = sourceOf(host);\n  const published = pickDate(row);\n  if (published && published.getTime() < cutoff) continue;\n\n  normalised.push({\n    id: fnv1a(url),\n    title: clean(row.title, 300),\n    excerpt: clean(row.contentSnippet || row.content || row.description || row.summary, 700),\n    url,\n    host,\n    source,\n    source_weight: weight,\n    published_at: published ? published.toISOString() : null,\n    age_hours: published ? Math.round(((now - published.getTime()) / 3600000) * 10) / 10 : null,\n    tokens: tokens(row.title),\n  });\n}\n\n// ── 2. cross-run memory ────────────────────────────────────────────────────\nlet memory = {};\nlet memoryAvailable = true;\ntry {\n  const staticData = $getWorkflowStaticData('global');\n  staticData.seen = staticData.seen || {};\n  const memCutoff = now - MEMORY_HOURS * 3600 * 1000;\n  for (const [key, ts] of Object.entries(staticData.seen)) {\n    if (ts >= memCutoff) memory[key] = ts;   // prune while we read\n  }\n  staticData.seen = memory;\n} catch (e) {\n  memoryAvailable = false;                    // never let dedup memory break a run\n}\n\n// ── 3. rank, then de-duplicate ─────────────────────────────────────────────\nnormalised.sort((a, b) => (b.source_weight - a.source_weight) || ((a.age_hours ?? 99) - (b.age_hours ?? 99)));\n\nconst kept = [];\nconst suppressed = [];   // duplicates we must also remember, see below\nconst stats = { fetched: $input.all().length, normalised: normalised.length, exact: 0, near: 0, seen_before: 0, capped: 0 };\n\nfor (const article of normalised) {\n  if (kept.length >= MAX_ITEMS) { stats.capped++; continue; }   // not \"seen\" — retry next run\n\n  if (kept.some((k) => k.id === article.id)) { stats.exact++; suppressed.push(article.id); continue; }\n  if (memoryAvailable && memory[article.id]) { stats.seen_before++; continue; }\n\n  const twin = kept.find((k) => k.source !== article.source && jaccard(k.tokens, article.tokens) >= TITLE_SIMILARITY);\n  if (twin) { stats.near++; suppressed.push(article.id); continue; }\n\n  kept.push(article);\n}\n\n// Remember the suppressed ones too. Without this, tomorrow's run drops the WSJ\n// original as \"seen\", finds no twin for the CNBC retelling still in the feed,\n// and re-alerts on a story that was already sent.\nif (memoryAvailable) for (const id of [...kept.map((a) => a.id), ...suppressed]) memory[id] = now;\n\nconsole.log(`dedupe: fetched=${stats.fetched} kept=${kept.length} exact=${stats.exact} near=${stats.near} seen_before=${stats.seen_before} capped=${stats.capped} memory=${memoryAvailable}`);\n\n// tokens is a Set — strip it before it leaves the node.\nreturn kept.map(({ tokens: _t, ...rest }) => ({ json: { ...rest, dedupe_stats: stats } }));\n"
+      },
+      "id": "normalize-and-deduplicate",
+      "name": "Normalize & Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are a financial news analyst. For the single article given, return ONLY a JSON object with exactly these keys:\n  \"id\"           — copy the Article ID verbatim, unchanged.\n  \"summary\"      — 1-2 sentences, max 300 characters, factual, no hedging, no preamble.\n  \"category\"     — one of: monetary_policy, earnings, macro_data, geopolitics, commodities, crypto, corporate_action, general.\n  \"sentiment\"    — one of: positive, negative, neutral (market impact, not tone of writing).\n  \"impact_score\" — number 0-10. How much this moves markets in the next 24h. Reserve 8+ for rate decisions, mega-cap earnings surprises, and major geopolitical shocks. Routine coverage is 3-5.\n  \"tickers\"      — array of uppercase tickers or symbols explicitly discussed; empty array if none.\nNo markdown, no code fences, no commentary. If the article is not about markets or the economy, still return the object with category \"general\" and a low impact_score.",
+              "role": "system"
+            },
+            {
+              "content": "=Article ID: {{ $json.id }}\nSource: {{ $json.source }}\nPublished: {{ $json.published_at }}\nHeadline: {{ $json.title }}\nExcerpt: {{ $json.excerpt }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 400
+        }
+      },
+      "id": "summarize-and-classify",
+      "name": "Summarize & Classify",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        500,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      },
+      "notes": "3 retries with 5s backoff; persistent failures take the error output."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Parse the model response and re-join it to the article it came from.\n//\n// Two problems this solves:\n//\n//  a) The OpenAI node replaces the item — the article fields are gone from the\n//     stream. Re-joining by item index is fragile: the moment one item takes\n//     the node's error output, every index downstream is off by one. So the\n//     model is asked to echo the article `id`, and the join is done on that.\n//\n//  b) An LLM returns JSON \"usually\". A pipeline that throws on the one run\n//     where it wraps the object in ```json fences is a pipeline that pages you\n//     at 3am. Parsing is defensive, and an unparseable response degrades to a\n//     low-impact record instead of killing the execution.\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst CATEGORIES = ['monetary_policy', 'earnings', 'macro_data', 'geopolitics',\n                    'commodities', 'crypto', 'corporate_action', 'general'];\nconst SENTIMENTS = ['positive', 'negative', 'neutral'];\n\nconst articles = new Map();\nfor (const item of $('Normalize & Deduplicate').all()) articles.set(item.json.id, item.json);\n\nfunction extractContent(json) {\n  const candidate = json?.message?.content ?? json?.content ?? json?.text ?? json?.output ?? json;\n  if (typeof candidate !== 'string') return candidate;\n  const fenced = candidate.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  const raw = (fenced ? fenced[1] : candidate).trim();\n  try { return JSON.parse(raw); } catch (e) { /* fall through */ }\n  const braced = raw.match(/\\{[\\s\\S]*\\}/);\n  if (braced) { try { return JSON.parse(braced[0]); } catch (e) { /* give up */ } }\n  return null;\n}\n\nconst out = [];\nlet index = 0;\n\nfor (const item of $input.all()) {\n  const parsed = extractContent(item.json);\n  const article = articles.get(parsed?.id) ?? [...articles.values()][index];\n  index++;\n  if (!article) continue;\n\n  const impact = Number(parsed?.impact_score);\n  out.push({\n    json: {\n      ...article,\n      summary: String(parsed?.summary ?? article.excerpt ?? '').slice(0, 600),\n      category: CATEGORIES.includes(parsed?.category) ? parsed.category : 'general',\n      sentiment: SENTIMENTS.includes(parsed?.sentiment) ? parsed.sentiment : 'neutral',\n      impact_score: Number.isFinite(impact) ? Math.min(Math.max(impact, 0), 10) : 5,\n      tickers: Array.isArray(parsed?.tickers)\n        ? parsed.tickers.filter((t) => typeof t === 'string').slice(0, 10).map((t) => t.toUpperCase())\n        : [],\n      llm_parse_ok: parsed !== null,\n    },\n  });\n}\n\nconsole.log(`llm parse: in=${$input.all().length} out=${out.length} failed=${out.filter((o) => !o.json.llm_parse_ok).length}`);\nreturn out;\n"
+      },
+      "id": "parse-llm-output",
+      "name": "Parse LLM Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://REPLACE-ME.up.railway.app/v1/enrich",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: $json.title, summary: $json.summary, url: $json.url, source: $json.source, published_at: $json.published_at, category: $json.category, impact_score: $json.impact_score, sentiment: $json.sentiment, tickers: $json.tickers, client_ref: $json.id }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "enrich-via-custom-api",
+      "name": "Enrich via Custom API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Enrichment API key"
+        }
+      },
+      "notes": "Header Auth credential holds X-API-Key, so no secret lives in this JSON."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Flatten into one row per article, shaped exactly like the Google Sheet.\n// The Sheets node uses auto-map, so the field names below ARE the column\n// headers — keep them in sync with the sheet, not with the internal payloads.\n// Joined on client_ref, which the enrichment API echoes back verbatim.\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst articles = new Map();\nfor (const item of $('Parse LLM Output').all()) articles.set(item.json.id, item.json);\n\nconst rows = [];\n\nfor (const item of $input.all()) {\n  const api = item.json;\n  const article = articles.get(api.client_ref);\n  if (!article) continue;\n\n  const breakdown = api.score_breakdown ?? {};\n\n  rows.push({\n    json: {\n      timestamp: new Date().toISOString(),\n      id: article.id,\n      published_at: article.published_at ?? '',\n      age_hours: article.age_hours ?? '',\n      source: article.source,\n      title: article.title,\n      summary: article.summary,\n      category: article.category,\n      sentiment: article.sentiment,\n      impact_score: article.impact_score,\n      entities: (api.entities ?? []).map((e) => e.symbol).join(', '),\n      sectors: (api.sectors ?? []).join(', '),\n      relevance_score: api.relevance_score ?? 0,\n      priority: api.priority ?? 'low',\n      cluster_id: api.cluster_id ?? '',\n      is_followup: api.is_followup ? 'yes' : 'no',\n      score_reason: api.reason ?? '',\n      score_recency: breakdown.recency ?? '',\n      score_novelty: breakdown.novelty ?? '',\n      url: article.url,\n    },\n  });\n}\n\nrows.sort((a, b) => b.json.relevance_score - a.json.relevance_score);\nconsole.log(`assembled ${rows.length} rows; high=${rows.filter((r) => r.json.priority === 'high').length}`);\nreturn rows;\n"
+      },
+      "id": "assemble-record",
+      "name": "Assemble Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "relevance-gate",
+              "leftValue": "={{ $json.relevance_score }}",
+              "rightValue": 70,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "route-by-priority",
+      "name": "Route by Priority",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1500,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "market-alerts",
+          "mode": "name",
+          "cachedResultName": "market-alerts"
+        },
+        "text": "=:rotating_light: *{{ $json.priority.toUpperCase() }} — {{ $json.relevance_score }}/100*  _{{ $json.category }} · {{ $json.sentiment }}_\n*{{ $json.title }}*\n{{ $json.summary }}\n> entities: `{{ $json.entities || 'none resolved' }}`  ·  source: {{ $json.source }}  ·  age: {{ $json.age_hours }}h\n> scoring: {{ $json.score_reason }}\n{{ $json.url }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false,
+          "mrkdwn": true
+        }
+      },
+      "id": "slack-high-impact-alert",
+      "name": "Slack: High-Impact Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1740,
+        -120
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      },
+      "notes": "Slack being down must not stop the row reaching the sheet."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "articles",
+          "mode": "name",
+          "cachedResultName": "articles"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "log-to-google-sheets",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1980,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Error lane.\n//\n// Both the model call and the enrichment API call route their error output\n// here. Each has already exhausted its retries (3 attempts, backoff) before an\n// item reaches this node, so anything arriving is a real, persistent failure\n// worth waking someone for — not a transient blip.\n//\n// The job here is to turn n8n's raw error object into something a human can\n// act on from a phone: which stage, which article, what the upstream actually\n// said, and whether the run produced anything at all.\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst failures = $input.all();\nif (failures.length === 0) return [];\n\nfunction describe(json) {\n  const err = json?.error ?? json;\n  const status = err?.httpCode ?? err?.status ?? err?.statusCode ?? json?.statusCode ?? null;\n  const message = err?.message ?? err?.description ?? err?.detail ?? 'Unknown error';\n  const upstream = err?.response?.body ?? err?.body ?? null;\n\n  let stage = 'unknown';\n  if (typeof message === 'string') {\n    if (/openai|model|token|rate limit/i.test(message)) stage = 'llm';\n    else if (/enrich|econnrefused|etimedout|fetch|socket|502|503|504/i.test(message)) stage = 'enrichment_api';\n  }\n  if (status === 401 || status === 403) stage = stage === 'unknown' ? 'auth' : stage;\n\n  return {\n    stage,\n    status,\n    message: String(message).slice(0, 400),\n    upstream: upstream ? String(typeof upstream === 'string' ? upstream : JSON.stringify(upstream)).slice(0, 300) : '',\n    article: json?.title ?? json?.url ?? json?.id ?? '(no article context)',\n  };\n}\n\nconst details = failures.map((f) => describe(f.json));\nconst byStage = details.reduce((acc, d) => ({ ...acc, [d.stage]: (acc[d.stage] ?? 0) + 1 }), {});\n\n// Was anything salvaged, or did the whole run fail? Changes how urgent this is.\nlet delivered = 0;\ntry { delivered = $('Assemble Record').all().length; } catch (e) { delivered = 0; }\n\nconst worst = details[0];\nconst summary = Object.entries(byStage).map(([k, v]) => `${k}×${v}`).join(', ');\n\nconsole.log(`pipeline failures: ${failures.length} (${summary}); delivered=${delivered}`);\n\nreturn [{\n  json: {\n    failed_count: failures.length,\n    delivered_count: delivered,\n    severity: delivered === 0 ? 'critical' : 'degraded',\n    stages: summary,\n    first_error_stage: worst.stage,\n    first_error_status: worst.status ?? 'n/a',\n    first_error_message: worst.message,\n    first_error_upstream: worst.upstream,\n    first_error_article: worst.article,\n    sample: details.slice(0, 5).map((d) => `• [${d.stage}${d.status ? ' ' + d.status : ''}] ${d.article} — ${d.message}`).join('\\n'),\n    workflow: $workflow.name,\n    execution_url: $execution?.resumeUrl ?? '',\n    execution_id: $execution?.id ?? '',\n    failed_at: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "id": "handle-failure",
+      "name": "Handle Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "ops-alerts",
+          "mode": "name",
+          "cachedResultName": "ops-alerts"
+        },
+        "text": "=:warning: *Market Intelligence pipeline — {{ $json.severity }}*\n{{ $json.failed_count }} item(s) failed after retries · {{ $json.delivered_count }} delivered successfully\nFailing stages: `{{ $json.stages }}`\n```{{ $json.sample }}```\n_execution {{ $json.execution_id }} · {{ $json.failed_at }}_",
+        "otherOptions": {
+          "includeLinkToWorkflow": true,
+          "mrkdwn": true
+        }
+      },
+      "id": "slack-pipeline-failure",
+      "name": "Slack: Pipeline Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1340,
+        240
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Feed Registry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feed Registry": {
+      "main": [
+        [
+          {
+            "node": "Fetch RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch RSS": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Summarize & Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize & Classify": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Output",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Output": {
+      "main": [
+        [
+          {
+            "node": "Enrich via Custom API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich via Custom API": {
+      "main": [
+        [
+          {
+            "node": "Assemble Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Record": {
+      "main": [
+        [
+          {
+            "node": "Route by Priority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Priority": {
+      "main": [
+        [
+          {
+            "node": "Slack: High-Impact Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: High-Impact Alert": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Failure": {
+      "main": [
+        [
+          {
+            "node": "Slack: Pipeline Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 600,
+    "timezone": "Asia/Seoul"
+  },
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
